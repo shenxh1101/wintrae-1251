@@ -27,6 +27,21 @@ class WaitlistStatus(str, enum.Enum):
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
     ENROLLED = "enrolled"
+    ATTENDED = "attended"
+    NO_SHOW = "no_show"
+
+
+class MemberLevel(str, enum.Enum):
+    NORMAL = "normal"
+    SILVER = "silver"
+    GOLD = "gold"
+    PLATINUM = "platinum"
+
+
+class AttendanceStatus(str, enum.Enum):
+    PENDING = "pending"
+    ATTENDED = "attended"
+    NO_SHOW = "no_show"
 
 
 class NotificationType(str, enum.Enum):
@@ -115,6 +130,9 @@ class Student(Base):
     email = Column(String(100))
     wechat_id = Column(String(50))
     preferred_channel = Column(Enum(NotificationChannel), default=NotificationChannel.SMS)
+    member_level = Column(Enum(MemberLevel), default=MemberLevel.NORMAL)
+    is_returning_student = Column(Boolean, default=False)
+    backup_channels = Column(String(200))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -129,11 +147,16 @@ class WaitlistEntry(Base):
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
     status = Column(Enum(WaitlistStatus), default=WaitlistStatus.PENDING, nullable=False, index=True)
     queue_position = Column(Integer, nullable=False)
+    priority_score = Column(Integer, default=0)
+    is_urgent = Column(Boolean, default=False)
     notified_at = Column(DateTime)
     confirmed_at = Column(DateTime)
     timeout_at = Column(DateTime)
     cancelled_at = Column(DateTime)
     cancel_reason = Column(String(255))
+    attended_at = Column(DateTime)
+    attendance_status = Column(Enum(AttendanceStatus), default=AttendanceStatus.PENDING)
+    no_show_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -144,6 +167,7 @@ class WaitlistEntry(Base):
     __table_args__ = (
         UniqueConstraint("slot_id", "student_id", name="uix_slot_student"),
         Index("idx_slot_status_created", "slot_id", "status", "created_at"),
+        Index("idx_slot_priority_created", "slot_id", "priority_score", "created_at"),
     )
 
 
@@ -160,6 +184,29 @@ class Notification(Base):
     delivered_at = Column(DateTime)
     read_at = Column(DateTime)
     error_message = Column(String(255))
+    attempt_count = Column(Integer, default=1)
+    next_retry_at = Column(DateTime)
+    channel_attempt_order = Column(String(100))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     waitlist_entry = relationship("WaitlistEntry", back_populates="notifications")
+    attempts = relationship("NotificationAttempt", back_populates="notification", cascade="all, delete-orphan")
+
+
+class NotificationAttempt(Base):
+    __tablename__ = "notification_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    notification_id = Column(Integer, ForeignKey("notifications.id"), nullable=False)
+    channel = Column(Enum(NotificationChannel), nullable=False)
+    status = Column(Enum(NotificationStatus), nullable=False)
+    attempt_number = Column(Integer, nullable=False)
+    sent_at = Column(DateTime, default=datetime.utcnow)
+    error_message = Column(String(255))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    notification = relationship("Notification", back_populates="attempts")
+
+    __table_args__ = (
+        Index("idx_notification_attempt", "notification_id", "attempt_number"),
+    )

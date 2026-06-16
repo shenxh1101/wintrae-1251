@@ -12,6 +12,8 @@ from app.models import (
     Course,
     Store,
     NotificationType,
+    MemberLevel,
+    AttendanceStatus,
 )
 from app.schemas import (
     WaitlistEntryCreate,
@@ -24,6 +26,37 @@ from app.services.notification_service import notification_service
 
 
 class WaitlistService:
+    def _calculate_priority_score(self, student: Student, is_urgent: bool = False) -> int:
+        score = 0
+        if student.member_level == MemberLevel.SILVER:
+            score += settings.MEMBER_LEVEL_SCORE_SILVER
+        elif student.member_level == MemberLevel.GOLD:
+            score += settings.MEMBER_LEVEL_SCORE_GOLD
+        elif student.member_level == MemberLevel.PLATINUM:
+            score += settings.MEMBER_LEVEL_SCORE_PLATINUM
+        if student.is_returning_student:
+            score += settings.RETURNING_STUDENT_BONUS
+        if is_urgent:
+            score += settings.URGENT_BONUS
+        return score
+
+    def _get_priority_reasons(self, student: Student, is_urgent: bool) -> List[str]:
+        reasons = []
+        level_names = {
+            MemberLevel.SILVER: "银牌会员",
+            MemberLevel.GOLD: "金牌会员",
+            MemberLevel.PLATINUM: "铂金会员",
+        }
+        if student.member_level in level_names:
+            reasons.append(f"{level_names[student.member_level]}加成")
+        if student.is_returning_student:
+            reasons.append("老学员加成")
+        if is_urgent:
+            reasons.append("手动加急")
+        if not reasons:
+            reasons.append("按提交时间排序")
+        return reasons
+
     def create_waitlist_entry(
         self,
         db: Session,
@@ -64,24 +97,20 @@ class WaitlistService:
                 f"Student has exceeded maximum waitlist limit of {settings.MAX_WAITLIST_PER_STUDENT}"
             )
 
-        current_max_position = db.query(func.max(WaitlistEntry.queue_position)).filter(
-            and_(
-                WaitlistEntry.slot_id == entry_in.slot_id,
-                WaitlistEntry.status.in_([
-                    WaitlistStatus.PENDING,
-                    WaitlistStatus.NOTIFIED,
-                ]),
-            )
-        ).scalar() or 0
+        priority_score = self._calculate_priority_score(student, entry_in.is_urgent or False)
 
         entry = WaitlistEntry(
             slot_id=entry_in.slot_id,
             student_id=entry_in.student_id,
             status=WaitlistStatus.PENDING,
-            queue_position=current_max_position + 1,
+            queue_position=0,
+            priority_score=priority_score,
+            is_urgent=entry_in.is_urgent or False,
+            attendance_status=AttendanceStatus.PENDING,
         )
         db.add(entry)
-        db.commit()
+        db.flush()
+        self._rebuild_queue_positions(db, entry_in.slot_id)
         db.refresh(entry)
         return entry
 
@@ -127,7 +156,6 @@ class WaitlistService:
             db=db,
             waitlist_entry_id=entry.id,
             notification_type=NotificationType.CANCEL_NOTICE,
-            channel=entry.student.preferred_channel,
             content=f"您已成功取消【{entry.slot.course.name}】课程候补。",
         )
 
@@ -135,6 +163,66 @@ class WaitlistService:
             self._notify_next_pending(db, entry.slot_id, rollover_reason="前一位学员主动取消候补")
 
         db.commit()
+        db.refresh(entry)
+        return entry
+
+    def mark_attendance(
+        self,
+        db: Session,
+        entry_id: int,
+        attendance_status: AttendanceStatus,
+    ) -> WaitlistEntry:
+        entry = db.query(WaitlistEntry).filter(WaitlistEntry.id == entry_id).first()
+        if not entry:
+            raise ValueError("Waitlist entry not found")
+
+        if entry.status not in [WaitlistStatus.CONFIRMED, WaitlistStatus.ATTENDED, WaitlistStatus.NO_SHOW]:
+            raise ValueError("Can only mark attendance for confirmed or already attended entries")
+
+        if attendance_status == AttendanceStatus.ATTENDED:
+            entry.status = WaitlistStatus.ATTENDED
+            entry.attendance_status = AttendanceStatus.ATTENDED
+            entry.attended_at = datetime.utcnow()
+            notification_service.create_notification(
+                db=db,
+                waitlist_entry_id=entry.id,
+                notification_type=NotificationType.CONFIRMATION,
+                content=f"【到课确认】您已成功签到【{entry.slot.course.name}】课程，祝您学习愉快！",
+            )
+        elif attendance_status == AttendanceStatus.NO_SHOW:
+            entry.status = WaitlistStatus.NO_SHOW
+            entry.attendance_status = AttendanceStatus.NO_SHOW
+            entry.no_show_at = datetime.utcnow()
+            if entry.slot.enrolled_count > 0:
+                entry.slot.enrolled_count -= 1
+            notification_service.create_notification(
+                db=db,
+                waitlist_entry_id=entry.id,
+                notification_type=NotificationType.CANCEL_NOTICE,
+                content=f"【未到课提醒】您未按时参加【{entry.slot.course.name}】课程，本次补位名额已作废。",
+            )
+
+        db.commit()
+        db.refresh(entry)
+        return entry
+
+    def set_urgent(
+        self,
+        db: Session,
+        entry_id: int,
+        is_urgent: bool,
+    ) -> WaitlistEntry:
+        entry = db.query(WaitlistEntry).filter(WaitlistEntry.id == entry_id).first()
+        if not entry:
+            raise ValueError("Waitlist entry not found")
+
+        if entry.status not in [WaitlistStatus.PENDING, WaitlistStatus.NOTIFIED]:
+            raise ValueError("Can only set urgent flag for active entries")
+
+        entry.is_urgent = is_urgent
+        entry.priority_score = self._calculate_priority_score(entry.student, is_urgent)
+
+        self._rebuild_queue_positions(db, entry.slot_id)
         db.refresh(entry)
         return entry
 
@@ -159,24 +247,29 @@ class WaitlistService:
 
         current_position = entry.queue_position if entry.status in [
             WaitlistStatus.PENDING, WaitlistStatus.NOTIFIED
-        ] else None
+        ] else 0
 
         estimated_opportunity = self._calculate_estimated_opportunity(
-            db, entry.slot_id, current_position or 0
+            db, entry.slot_id, current_position
         )
+
+        priority_reasons = self._get_priority_reasons(entry.student, entry.is_urgent)
 
         return WaitlistPositionResponse(
             entry_id=entry.id,
             slot_id=entry.slot_id,
             course_name=entry.slot.course.name,
             slot_start_time=entry.slot.start_time,
-            current_position=current_position or 0,
+            current_position=current_position,
             total_waiting=total_waiting,
             status=entry.status,
             estimated_opportunity=estimated_opportunity,
             notified_at=entry.notified_at,
             timeout_at=entry.timeout_at,
             created_at=entry.created_at,
+            priority_score=entry.priority_score,
+            is_urgent=entry.is_urgent,
+            priority_reasons=priority_reasons,
         )
 
     def get_student_waitlists(
@@ -261,7 +354,6 @@ class WaitlistService:
                 db=db,
                 waitlist_entry_id=entry.id,
                 notification_type=NotificationType.CONFIRMATION,
-                channel=entry.student.preferred_channel,
                 content=f"恭喜！您已成功确认【{entry.slot.course.name}】的补位名额，请按时上课。",
             )
         else:
@@ -271,7 +363,6 @@ class WaitlistService:
                 db=db,
                 waitlist_entry_id=entry.id,
                 notification_type=NotificationType.CANCEL_NOTICE,
-                channel=entry.student.preferred_channel,
                 content=f"您已放弃【{entry.slot.course.name}】的补位机会，候补资格已取消。",
             )
 
@@ -376,6 +467,14 @@ class WaitlistService:
             (WaitlistEntry.status == WaitlistStatus.ENROLLED, WaitlistEntry.id),
             else_=None
         )
+        attended_case = case(
+            (WaitlistEntry.status == WaitlistStatus.ATTENDED, WaitlistEntry.id),
+            else_=None
+        )
+        no_show_case = case(
+            (WaitlistEntry.status == WaitlistStatus.NO_SHOW, WaitlistEntry.id),
+            else_=None
+        )
 
         query = db.query(
             Store.id,
@@ -384,6 +483,8 @@ class WaitlistService:
             func.count(func.distinct(waitlist_case)).label("total_waitlist"),
             func.count(func.distinct(confirmed_case)).label("total_confirmed"),
             func.count(func.distinct(enrolled_case)).label("total_enrolled"),
+            func.count(func.distinct(attended_case)).label("total_attended"),
+            func.count(func.distinct(no_show_case)).label("total_no_show"),
         ).select_from(Store).outerjoin(Course).outerjoin(CourseSlot).outerjoin(
             WaitlistEntry,
             WaitlistEntry.slot_id == CourseSlot.id
@@ -398,8 +499,14 @@ class WaitlistService:
         for row in results:
             total_waitlist = row.total_waitlist or 0
             total_confirmed = row.total_confirmed or 0
+            total_attended = row.total_attended or 0
+            total_no_show = row.total_no_show or 0
             conversion_rate = (
                 total_confirmed / total_waitlist if total_waitlist > 0 else 0.0
+            )
+            total_marked = total_attended + total_no_show
+            attendance_rate = (
+                total_attended / total_marked if total_marked > 0 else 0.0
             )
             avg_wait_time = self._calculate_average_wait_time(db, row.id)
 
@@ -410,6 +517,9 @@ class WaitlistService:
                 total_waitlist=total_waitlist,
                 total_confirmed=total_confirmed,
                 total_enrolled=row.total_enrolled or 0,
+                total_attended=total_attended,
+                total_no_show=total_no_show,
+                attendance_rate=round(attendance_rate, 4),
                 conversion_rate=round(conversion_rate, 4),
                 average_wait_time_hours=avg_wait_time,
             ))
@@ -465,6 +575,8 @@ class WaitlistService:
                 declined_count=status_counts.get("declined", 0),
                 timeout_count=status_counts.get("timeout", 0),
                 cancelled_count=status_counts.get("cancelled", 0),
+                attended_count=status_counts.get("attended", 0),
+                no_show_count=status_counts.get("no_show", 0),
                 available_release_slots=available_release,
                 total_waitlist_count=sum(status_counts.values()),
             ))
@@ -496,7 +608,7 @@ class WaitlistService:
                 WaitlistEntry.status == WaitlistStatus.PENDING,
             )
         ).order_by(
-            WaitlistEntry.queue_position.asc(),
+            WaitlistEntry.priority_score.desc(),
             WaitlistEntry.created_at.asc(),
         ).first()
 
@@ -521,7 +633,6 @@ class WaitlistService:
             db=db,
             waitlist_entry_id=entry.id,
             notification_type=NotificationType.INVITATION,
-            channel=entry.student.preferred_channel,
             content=content,
         )
 
@@ -554,7 +665,6 @@ class WaitlistService:
                 db=db,
                 waitlist_entry_id=notified_entry.id,
                 notification_type=NotificationType.ROLLOVER_NOTICE,
-                channel=notified_entry.student.preferred_channel,
                 content=content,
             )
 
@@ -574,7 +684,6 @@ class WaitlistService:
             db=db,
             waitlist_entry_id=entry.id,
             notification_type=NotificationType.TIMEOUT_NOTICE,
-            channel=entry.student.preferred_channel,
             content=f"您候补的【{entry.slot.course.name}】课程确认已超时，候补资格已取消。",
         )
 
@@ -595,6 +704,7 @@ class WaitlistService:
                 ]),
             )
         ).order_by(
+            WaitlistEntry.priority_score.desc(),
             WaitlistEntry.created_at.asc(),
             WaitlistEntry.id.asc(),
         ).all()
@@ -658,6 +768,7 @@ class WaitlistService:
                 WaitlistEntry.status.in_([
                     WaitlistStatus.CONFIRMED,
                     WaitlistStatus.ENROLLED,
+                    WaitlistStatus.ATTENDED,
                 ]),
                 WaitlistEntry.notified_at.isnot(None),
                 WaitlistEntry.created_at.isnot(None),

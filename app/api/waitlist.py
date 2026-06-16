@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import WaitlistStatus
+from app.models import WaitlistStatus, AttendanceStatus
 from app.schemas import (
     WaitlistEntryCreate,
     WaitlistEntryCancel,
@@ -13,6 +13,8 @@ from app.schemas import (
     WaitlistPositionResponse,
     SlotReleaseRequest,
     TimeoutProcessRequest,
+    AttendanceMarkRequest,
+    WaitlistUrgentUpdate,
 )
 from app.services.waitlist_service import waitlist_service
 
@@ -128,3 +130,35 @@ def process_timeouts(
         "processed_entries": processed,
         "simulate_time_used": simulate_time.isoformat() if simulate_time else None,
     }
+
+
+@router.post("/{entry_id}/attendance", response_model=WaitlistEntryResponse, summary="标记到课状态")
+def mark_attendance(
+    entry_id: int,
+    mark_in: AttendanceMarkRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        return waitlist_service.mark_attendance(
+            db=db,
+            entry_id=entry_id,
+            attendance_status=mark_in.attendance_status,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.put("/{entry_id}/urgent", response_model=WaitlistEntryResponse, summary="设置/取消候补加急")
+def set_waitlist_urgent(
+    entry_id: int,
+    urgent_in: WaitlistUrgentUpdate,
+    db: Session = Depends(get_db),
+):
+    try:
+        return waitlist_service.set_urgent(
+            db=db,
+            entry_id=entry_id,
+            is_urgent=urgent_in.is_urgent,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

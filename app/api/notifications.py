@@ -104,3 +104,27 @@ def get_notification_stats(
     db: Session = Depends(get_db),
 ):
     return notification_service.get_notification_stats(db=db)
+
+
+@router.post("/{notification_id}/retry", response_model=NotificationResponse, summary="重试发送失败的通知")
+def retry_notification(
+    notification_id: int,
+    db: Session = Depends(get_db),
+):
+    result = notification_service.retry_notification(db=db, notification_id=notification_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Notification not found or cannot be retried")
+    return result
+
+
+@router.post("/retry-batch", summary="批量重试待处理的通知")
+def retry_pending_notifications(
+    limit: int = Query(50, ge=1, le=200, description="批量重试数量限制"),
+    db: Session = Depends(get_db),
+):
+    retried = notification_service.retry_pending_notifications(db=db, limit=limit)
+    return {
+        "message": f"Retried {len(retried)} notifications",
+        "retried_count": len(retried),
+        "retried_notifications": retried,
+    }

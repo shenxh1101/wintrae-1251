@@ -8,6 +8,8 @@ from app.models import (
     NotificationType,
     NotificationChannel,
     NotificationStatus,
+    MemberLevel,
+    AttendanceStatus,
 )
 
 
@@ -112,6 +114,9 @@ class StudentBase(BaseModel):
     email: Optional[str] = Field(None, max_length=100)
     wechat_id: Optional[str] = Field(None, max_length=50)
     preferred_channel: Optional[NotificationChannel] = NotificationChannel.SMS
+    member_level: Optional[MemberLevel] = MemberLevel.NORMAL
+    is_returning_student: Optional[bool] = False
+    backup_channels: Optional[str] = Field(None, max_length=200, description="备用渠道，逗号分隔，如: wechat,app,email")
 
 
 class StudentCreate(StudentBase):
@@ -124,6 +129,9 @@ class StudentUpdate(BaseModel):
     email: Optional[str] = Field(None, max_length=100)
     wechat_id: Optional[str] = Field(None, max_length=50)
     preferred_channel: Optional[NotificationChannel] = None
+    member_level: Optional[MemberLevel] = None
+    is_returning_student: Optional[bool] = None
+    backup_channels: Optional[str] = Field(None, max_length=200)
 
 
 class StudentResponse(StudentBase):
@@ -138,6 +146,7 @@ class StudentResponse(StudentBase):
 class WaitlistEntryCreate(BaseModel):
     slot_id: int
     student_id: int
+    is_urgent: Optional[bool] = False
 
 
 class WaitlistEntryCancel(BaseModel):
@@ -146,6 +155,14 @@ class WaitlistEntryCancel(BaseModel):
 
 class WaitlistEntryConfirm(BaseModel):
     confirmed: bool
+
+
+class WaitlistUrgentUpdate(BaseModel):
+    is_urgent: bool
+
+
+class AttendanceMarkRequest(BaseModel):
+    attendance_status: AttendanceStatus
 
 
 class WaitlistPositionResponse(BaseModel):
@@ -160,6 +177,9 @@ class WaitlistPositionResponse(BaseModel):
     notified_at: Optional[datetime]
     timeout_at: Optional[datetime]
     created_at: datetime
+    priority_score: int
+    is_urgent: bool
+    priority_reasons: List[str] = []
 
 
 class WaitlistEntryResponse(BaseModel):
@@ -168,15 +188,33 @@ class WaitlistEntryResponse(BaseModel):
     student_id: int
     status: WaitlistStatus
     queue_position: int
+    priority_score: int
+    is_urgent: bool
     notified_at: Optional[datetime]
     confirmed_at: Optional[datetime]
     timeout_at: Optional[datetime]
     cancelled_at: Optional[datetime]
     cancel_reason: Optional[str]
+    attended_at: Optional[datetime]
+    attendance_status: AttendanceStatus
+    no_show_at: Optional[datetime]
     created_at: datetime
     updated_at: datetime
     student: Optional[StudentResponse] = None
     slot: Optional[CourseSlotResponse] = None
+
+    class Config:
+        from_attributes = True
+
+
+class NotificationAttemptResponse(BaseModel):
+    id: int
+    notification_id: int
+    channel: NotificationChannel
+    status: NotificationStatus
+    attempt_number: int
+    sent_at: datetime
+    error_message: Optional[str]
 
     class Config:
         from_attributes = True
@@ -193,7 +231,11 @@ class NotificationResponse(BaseModel):
     delivered_at: Optional[datetime]
     read_at: Optional[datetime]
     error_message: Optional[str]
+    attempt_count: int
+    next_retry_at: Optional[datetime]
+    channel_attempt_order: Optional[str]
     created_at: datetime
+    attempts: List[NotificationAttemptResponse] = []
 
     class Config:
         from_attributes = True
@@ -217,6 +259,9 @@ class StoreConversionResponse(BaseModel):
     total_waitlist: int
     total_confirmed: int
     total_enrolled: int
+    total_attended: int
+    total_no_show: int
+    attendance_rate: float
     conversion_rate: float
     average_wait_time_hours: Optional[float]
 
@@ -247,6 +292,8 @@ class SlotWaitlistDashboardResponse(BaseModel):
     declined_count: int
     timeout_count: int
     cancelled_count: int
+    attended_count: int
+    no_show_count: int
     available_release_slots: int
     total_waitlist_count: int
 
