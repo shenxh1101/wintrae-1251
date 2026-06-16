@@ -226,6 +226,31 @@ class SlotReleaseRequest(BaseModel):
     release_count: int = Field(..., ge=1)
 
 
+class TimeoutProcessRequest(BaseModel):
+    simulate_time: Optional[datetime] = Field(None, description="指定模拟当前时间，用于测试或批量推进")
+    slot_id: Optional[int] = Field(None, description="只处理指定时间段的超时，不填则处理所有")
+
+
+class SlotWaitlistDashboardResponse(BaseModel):
+    slot_id: int
+    course_id: int
+    course_name: str
+    store_id: int
+    store_name: str
+    slot_start_time: datetime
+    slot_end_time: datetime
+    capacity: int
+    enrolled_count: int
+    pending_count: int
+    notified_count: int
+    confirmed_count: int
+    declined_count: int
+    timeout_count: int
+    cancelled_count: int
+    available_release_slots: int
+    total_waitlist_count: int
+
+
 class PaginatedResponse(BaseModel):
     total: int
     page: int

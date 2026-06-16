@@ -1,4 +1,5 @@
 from typing import List, Optional
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -11,6 +12,7 @@ from app.schemas import (
     WaitlistEntryResponse,
     WaitlistPositionResponse,
     SlotReleaseRequest,
+    TimeoutProcessRequest,
 )
 from app.services.waitlist_service import waitlist_service
 
@@ -104,11 +106,25 @@ def confirm_waitlist(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/process-timeouts", summary="处理超时未确认的候补")
-def process_timeouts(db: Session = Depends(get_db)):
-    processed = waitlist_service.process_timeouts(db=db)
+@router.post("/process-timeouts", summary="处理超时未确认的候补（支持模拟时间推进）")
+def process_timeouts(
+    timeout_in: Optional[TimeoutProcessRequest] = None,
+    db: Session = Depends(get_db),
+):
+    simulate_time = None
+    slot_id = None
+    if timeout_in:
+        simulate_time = timeout_in.simulate_time
+        slot_id = timeout_in.slot_id
+
+    processed = waitlist_service.process_timeouts(
+        db=db,
+        simulate_time=simulate_time,
+        slot_id=slot_id,
+    )
     return {
         "message": f"Processed {len(processed)} timeout entries",
         "processed_count": len(processed),
         "processed_entries": processed,
+        "simulate_time_used": simulate_time.isoformat() if simulate_time else None,
     }

@@ -35,6 +35,7 @@ class NotificationType(str, enum.Enum):
     CONFIRMATION = "confirmation"
     TIMEOUT_NOTICE = "timeout_notice"
     CANCEL_NOTICE = "cancel_notice"
+    ROLLOVER_NOTICE = "rollover_notice"
 
 
 class NotificationChannel(str, enum.Enum):
