@@ -15,6 +15,10 @@ from app.models import (
     MemberLevel,
     AttendanceStatus,
     PriorityConfig,
+    WaitlistAuditLog,
+    WaitlistAuditAction,
+    Notification,
+    NotificationStatus,
 )
 from app.schemas import (
     WaitlistEntryCreate,
@@ -63,6 +67,38 @@ class WaitlistService:
 
     def _get_urgent_bonus(self, config: Optional[PriorityConfig]) -> int:
         return config.urgent_bonus if config else settings.URGENT_BONUS
+
+    def _add_audit_log(
+        self,
+        db: Session,
+        entry: WaitlistEntry,
+        action: WaitlistAuditAction,
+        previous_status: Optional[WaitlistStatus] = None,
+        new_status: Optional[WaitlistStatus] = None,
+        previous_priority_score: Optional[int] = None,
+        new_priority_score: Optional[int] = None,
+        operator_id: Optional[str] = None,
+        operator_name: Optional[str] = None,
+        source: Optional[str] = None,
+        details: Optional[str] = None,
+    ) -> WaitlistAuditLog:
+        log = WaitlistAuditLog(
+            waitlist_entry_id=entry.id,
+            slot_id=entry.slot_id,
+            student_id=entry.student_id,
+            action=action,
+            previous_status=previous_status,
+            new_status=new_status,
+            previous_priority_score=previous_priority_score,
+            new_priority_score=new_priority_score,
+            operator_id=operator_id,
+            operator_name=operator_name,
+            source=source or "system",
+            details=details,
+        )
+        db.add(log)
+        db.flush()
+        return log
 
     def _calculate_priority_score(
         self,
@@ -195,6 +231,16 @@ class WaitlistService:
         db.flush()
         self._rebuild_queue_positions(db, entry_in.slot_id)
         db.refresh(entry)
+
+        self._add_audit_log(
+            db=db,
+            entry=entry,
+            action=WaitlistAuditAction.CREATED,
+            new_status=WaitlistStatus.PENDING,
+            new_priority_score=priority_score,
+            details=f"加入候补队列, 分数={priority_score}, 加急={'是' if entry.is_urgent else '否'}",
+        )
+
         return entry
 
     def preview_waitlist_position(
@@ -286,10 +332,20 @@ class WaitlistService:
             raise ValueError("Cannot cancel entry in current status")
 
         was_notified = entry.status == WaitlistStatus.NOTIFIED
+        previous_status = entry.status
 
         entry.status = WaitlistStatus.CANCELLED
         entry.cancelled_at = datetime.utcnow()
         entry.cancel_reason = cancel_reason
+
+        self._add_audit_log(
+            db=db,
+            entry=entry,
+            action=WaitlistAuditAction.CANCELLED,
+            previous_status=previous_status,
+            new_status=WaitlistStatus.CANCELLED,
+            details=f"取消候补, 原因: {cancel_reason or '未填写'}",
+        )
 
         self._rebuild_queue_positions(db, entry.slot_id)
 
@@ -328,6 +384,8 @@ class WaitlistService:
             entry.attended_at = datetime.utcnow()
             if previous_status == WaitlistStatus.NO_SHOW and entry.slot.enrolled_count < entry.slot.capacity:
                 entry.slot.enrolled_count += 1
+            audit_action = WaitlistAuditAction.ATTENDED
+            audit_details = "标记到课"
             notification_service.create_notification(
                 db=db,
                 waitlist_entry_id=entry.id,
@@ -340,12 +398,23 @@ class WaitlistService:
             entry.no_show_at = datetime.utcnow()
             if previous_status in [WaitlistStatus.CONFIRMED, WaitlistStatus.ATTENDED] and entry.slot.enrolled_count > 0:
                 entry.slot.enrolled_count -= 1
+            audit_action = WaitlistAuditAction.NO_SHOW
+            audit_details = "标记未到课"
             notification_service.create_notification(
                 db=db,
                 waitlist_entry_id=entry.id,
                 notification_type=NotificationType.CANCEL_NOTICE,
                 content=f"【未到课提醒】您未按时参加【{entry.slot.course.name}】课程，本次补位名额已作废。",
             )
+
+        self._add_audit_log(
+            db=db,
+            entry=entry,
+            action=audit_action,
+            previous_status=previous_status,
+            new_status=entry.status,
+            details=audit_details,
+        )
 
         db.commit()
         db.refresh(entry)
@@ -685,6 +754,8 @@ class WaitlistService:
             self._process_timeout(db, entry, rollover_reason="学员确认超时")
             raise ValueError("Confirmation timeout has expired")
 
+        previous_status = entry.status
+
         if confirmed:
             if entry.slot.enrolled_count >= entry.slot.capacity:
                 raise ValueError(
@@ -704,6 +775,15 @@ class WaitlistService:
                     message=f"学员确认补位成功",
                 )
 
+            self._add_audit_log(
+                db=db,
+                entry=entry,
+                action=WaitlistAuditAction.CONFIRMED,
+                previous_status=previous_status,
+                new_status=WaitlistStatus.CONFIRMED,
+                details="学员确认补位",
+            )
+
             notification_service.create_notification(
                 db=db,
                 waitlist_entry_id=entry.id,
@@ -720,6 +800,15 @@ class WaitlistService:
                     db, latest.id, "declined",
                     message=f"学员主动放弃补位",
                 )
+
+            self._add_audit_log(
+                db=db,
+                entry=entry,
+                action=WaitlistAuditAction.DECLINED,
+                previous_status=previous_status,
+                new_status=WaitlistStatus.DECLINED,
+                details="学员主动放弃补位",
+            )
 
             notification_service.create_notification(
                 db=db,
@@ -782,12 +871,22 @@ class WaitlistService:
     def _notify_next_in_queue(
         self, db: Session, entry: WaitlistEntry
     ) -> WaitlistEntry:
+        previous_status = entry.status
         entry.status = WaitlistStatus.NOTIFIED
         entry.notified_at = datetime.utcnow()
         entry.timeout_at = datetime.utcnow() + timedelta(
             minutes=settings.NOTIFICATION_TIMEOUT_MINUTES
         )
         entry.queue_position = 0
+
+        self._add_audit_log(
+            db=db,
+            entry=entry,
+            action=WaitlistAuditAction.NOTIFIED,
+            previous_status=previous_status,
+            new_status=WaitlistStatus.NOTIFIED,
+            details=f"发送补位邀请, 超时时间: {entry.timeout_at.strftime('%Y-%m-%d %H:%M')}",
+        )
 
         notification_service.create_notification(
             db=db,
@@ -840,6 +939,7 @@ class WaitlistService:
         if entry.status != WaitlistStatus.NOTIFIED:
             return None
 
+        previous_status = entry.status
         entry.status = WaitlistStatus.TIMEOUT
 
         notifications = entry.notifications
@@ -849,6 +949,15 @@ class WaitlistService:
                 db, latest.id, "timeout",
                 message=f"{rollover_reason}，自动顺延下一位",
             )
+
+        self._add_audit_log(
+            db=db,
+            entry=entry,
+            action=WaitlistAuditAction.TIMEOUT,
+            previous_status=previous_status,
+            new_status=WaitlistStatus.TIMEOUT,
+            details=f"确认超时, 原因: {rollover_reason}",
+        )
 
         notification_service.create_notification(
             db=db,
@@ -1184,6 +1293,272 @@ class WaitlistService:
             ))
 
         return results
+
+    def refresh_priority_for_course(
+        self,
+        db: Session,
+        course_id: int,
+        operator_id: Optional[str] = None,
+        operator_name: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> dict:
+        course = db.query(Course).filter(Course.id == course_id).first()
+        if not course:
+            raise ValueError("Course not found")
+
+        entries_to_refresh = db.query(WaitlistEntry).join(CourseSlot).filter(
+            and_(
+                CourseSlot.course_id == course_id,
+                WaitlistEntry.status.in_([
+                    WaitlistStatus.PENDING,
+                    WaitlistStatus.NOTIFIED,
+                ]),
+            )
+        ).order_by(
+            WaitlistEntry.priority_score.desc(),
+            WaitlistEntry.created_at.asc(),
+        ).all()
+
+        updated_count = 0
+        for entry in entries_to_refresh:
+            old_score = entry.priority_score
+            new_score = self._calculate_priority_score(
+                entry.student, course_id, entry.is_urgent, db
+            )
+            if old_score != new_score:
+                entry.priority_score = new_score
+
+                self._add_audit_log(
+                    db=db,
+                    entry=entry,
+                    action=WaitlistAuditAction.PRIORITY_RECALCULATED,
+                    previous_priority_score=old_score,
+                    new_priority_score=new_score,
+                    operator_id=operator_id,
+                    operator_name=operator_name,
+                    source=source,
+                    details=f"课程优先级配置变更, 分数 {old_score} -> {new_score}",
+                )
+
+                updated_count += 1
+
+        slots = db.query(CourseSlot).filter(CourseSlot.course_id == course_id).all()
+        for slot in slots:
+            self._rebuild_queue_positions(db, slot.id)
+
+        db.commit()
+
+        return {
+            "course_id": course_id,
+            "total_checked": len(entries_to_refresh),
+            "total_updated": updated_count,
+            "slots_refreshed": len(slots),
+        }
+
+    def get_funnel_daily_report(
+        self,
+        db: Session,
+        store_id: Optional[int] = None,
+        course_id: Optional[int] = None,
+        slot_id: Optional[int] = None,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+    ) -> dict:
+        slot_query = db.query(CourseSlot).join(Course).join(Store).filter(
+            CourseSlot.is_active == True,
+            Course.is_active == True,
+            Store.is_active == True,
+        )
+
+        if store_id:
+            slot_query = slot_query.filter(Store.id == store_id)
+        if course_id:
+            slot_query = slot_query.filter(Course.id == course_id)
+        if slot_id:
+            slot_query = slot_query.filter(CourseSlot.id == slot_id)
+        if date_from:
+            slot_query = slot_query.filter(CourseSlot.start_time >= date_from)
+        if date_to:
+            slot_query = slot_query.filter(CourseSlot.start_time <= date_to)
+
+        slots = slot_query.order_by(CourseSlot.start_time.asc()).all()
+
+        report_data = []
+        totals = {
+            "total_waitlist": 0,
+            "total_notified": 0,
+            "total_delivered": 0,
+            "total_read": 0,
+            "total_confirmed": 0,
+            "total_declined": 0,
+            "total_timeout": 0,
+            "total_attended": 0,
+            "total_no_show": 0,
+        }
+
+        for slot in slots:
+            total_waitlist = db.query(WaitlistEntry).filter(
+                and_(
+                    WaitlistEntry.slot_id == slot.id,
+                    WaitlistEntry.status.notin_([WaitlistStatus.CANCELLED]),
+                )
+            ).count()
+
+            notified_entries = db.query(WaitlistEntry).filter(
+                and_(
+                    WaitlistEntry.slot_id == slot.id,
+                    WaitlistEntry.status.notin_([WaitlistStatus.PENDING, WaitlistStatus.CANCELLED]),
+                )
+            ).all()
+
+            total_notified = len(notified_entries)
+
+            notification_ids = []
+            for e in notified_entries:
+                for n in e.notifications:
+                    if n.type == NotificationType.INVITATION:
+                        notification_ids.append(n.id)
+                        break
+
+            total_delivered = 0
+            total_read = 0
+            if notification_ids:
+                total_delivered = db.query(Notification).filter(
+                    and_(
+                        Notification.id.in_(notification_ids),
+                        Notification.status.in_([NotificationStatus.DELIVERED, NotificationStatus.READ]),
+                    )
+                ).count()
+
+                total_read = db.query(Notification).filter(
+                    and_(
+                        Notification.id.in_(notification_ids),
+                        Notification.status == NotificationStatus.READ,
+                    )
+                ).count()
+
+            stats = db.query(
+                func.count(case(
+                    (WaitlistEntry.status == WaitlistStatus.CONFIRMED, WaitlistEntry.id),
+                    else_=None
+                )).label("confirmed"),
+                func.count(case(
+                    (WaitlistEntry.status == WaitlistStatus.DECLINED, WaitlistEntry.id),
+                    else_=None
+                )).label("declined"),
+                func.count(case(
+                    (WaitlistEntry.status == WaitlistStatus.TIMEOUT, WaitlistEntry.id),
+                    else_=None
+                )).label("timeout"),
+                func.count(case(
+                    (WaitlistEntry.status == WaitlistStatus.ATTENDED, WaitlistEntry.id),
+                    else_=None
+                )).label("attended"),
+                func.count(case(
+                    (WaitlistEntry.status == WaitlistStatus.NO_SHOW, WaitlistEntry.id),
+                    else_=None
+                )).label("no_show"),
+            ).filter(WaitlistEntry.slot_id == slot.id).first()
+
+            total_confirmed = stats.confirmed or 0
+            total_declined = stats.declined or 0
+            total_timeout = stats.timeout or 0
+            total_attended = stats.attended or 0
+            total_no_show = stats.no_show or 0
+
+            notification_rate = round(total_notified / total_waitlist, 4) if total_waitlist > 0 else 0.0
+            delivery_rate = round(total_delivered / total_notified, 4) if total_notified > 0 else 0.0
+            read_rate = round(total_read / total_notified, 4) if total_notified > 0 else 0.0
+            confirmation_rate = round(total_confirmed / total_notified, 4) if total_notified > 0 else 0.0
+            total_marked = total_attended + total_no_show
+            attendance_rate = round(total_attended / total_marked, 4) if total_marked > 0 else 0.0
+            conversion_rate = round(total_confirmed / total_waitlist, 4) if total_waitlist > 0 else 0.0
+
+            report_data.append({
+                "date": slot.start_time.strftime("%Y-%m-%d"),
+                "course_id": slot.course_id,
+                "course_name": slot.course.name,
+                "store_id": slot.course.store_id,
+                "store_name": slot.course.store.name,
+                "slot_id": slot.id,
+                "slot_start_time": slot.start_time,
+                "slot_end_time": slot.end_time,
+                "total_waitlist": total_waitlist,
+                "total_notified": total_notified,
+                "total_delivered": total_delivered,
+                "total_read": total_read,
+                "total_confirmed": total_confirmed,
+                "total_declined": total_declined,
+                "total_timeout": total_timeout,
+                "total_attended": total_attended,
+                "total_no_show": total_no_show,
+                "notification_rate": notification_rate,
+                "delivery_rate": delivery_rate,
+                "read_rate": read_rate,
+                "confirmation_rate": confirmation_rate,
+                "attendance_rate": attendance_rate,
+                "conversion_rate": conversion_rate,
+            })
+
+            for k in totals:
+                totals[k] += locals()[k]
+
+        total_records = len(report_data)
+        summary = dict(totals)
+        if total_records > 0:
+            summary["avg_notification_rate"] = round(
+                totals["total_notified"] / totals["total_waitlist"], 4
+            ) if totals["total_waitlist"] > 0 else 0.0
+            summary["avg_delivery_rate"] = round(
+                totals["total_delivered"] / totals["total_notified"], 4
+            ) if totals["total_notified"] > 0 else 0.0
+            summary["avg_read_rate"] = round(
+                totals["total_read"] / totals["total_notified"], 4
+            ) if totals["total_notified"] > 0 else 0.0
+            summary["avg_confirmation_rate"] = round(
+                totals["total_confirmed"] / totals["total_notified"], 4
+            ) if totals["total_notified"] > 0 else 0.0
+            summary["avg_attendance_rate"] = round(
+                totals["total_attended"] / (totals["total_attended"] + totals["total_no_show"]), 4
+            ) if (totals["total_attended"] + totals["total_no_show"]) > 0 else 0.0
+            summary["avg_conversion_rate"] = round(
+                totals["total_confirmed"] / totals["total_waitlist"], 4
+            ) if totals["total_waitlist"] > 0 else 0.0
+
+        return {
+            "total_records": total_records,
+            "summary": summary,
+            "data": report_data,
+        }
+
+    def get_audit_logs(
+        self,
+        db: Session,
+        slot_id: Optional[int] = None,
+        student_id: Optional[int] = None,
+        action: Optional[str] = None,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> Tuple[int, List[WaitlistAuditLog]]:
+        query = db.query(WaitlistAuditLog).join(Student).join(CourseSlot)
+
+        if slot_id:
+            query = query.filter(WaitlistAuditLog.slot_id == slot_id)
+        if student_id:
+            query = query.filter(WaitlistAuditLog.student_id == student_id)
+        if action:
+            query = query.filter(WaitlistAuditLog.action == action)
+        if date_from:
+            query = query.filter(WaitlistAuditLog.created_at >= date_from)
+        if date_to:
+            query = query.filter(WaitlistAuditLog.created_at <= date_to)
+
+        total = query.count()
+        logs = query.order_by(WaitlistAuditLog.created_at.desc()).offset(skip).limit(limit).all()
+
+        return total, logs
 
 
 waitlist_service = WaitlistService()

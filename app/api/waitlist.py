@@ -9,6 +9,7 @@ from app.models import (
     AttendanceStatus,
     PriorityConfig,
     WaitlistEntry,
+    WaitlistAuditAction,
 )
 from app.schemas import (
     WaitlistEntryCreate,
@@ -25,7 +26,11 @@ from app.schemas import (
     WaitlistUrgentUpdate,
     PriorityConfigCreate,
     PriorityConfigUpdate,
+    PriorityConfigUpdateWithOperator,
     PriorityConfigResponse,
+    FunnelDailyResponse,
+    WaitlistAuditLogResponse,
+    WaitlistAuditLogQueryResponse,
 )
 from app.services.waitlist_service import waitlist_service
 
@@ -267,8 +272,15 @@ def create_priority_config(
         is_active=True,
     )
     db.add(config)
-    db.commit()
+    db.flush()
     db.refresh(config)
+
+    waitlist_service.refresh_priority_for_course(
+        db=db,
+        course_id=config_in.course_id,
+    )
+
+    db.commit()
     return config
 
 
@@ -288,7 +300,7 @@ def get_priority_config(
 @router.put("/priority-config/{course_id}", response_model=PriorityConfigResponse, summary="更新课程优先级配置")
 def update_priority_config(
     course_id: int,
-    config_in: PriorityConfigUpdate,
+    config_in: PriorityConfigUpdateWithOperator,
     db: Session = Depends(get_db),
 ):
     config = db.query(PriorityConfig).filter(
@@ -298,17 +310,109 @@ def update_priority_config(
         raise HTTPException(status_code=404, detail="Priority config not found for this course")
 
     update_data = config_in.model_dump(exclude_unset=True)
+    operator_fields = {"operator_id", "operator_name", "source"}
     for field, value in update_data.items():
-        setattr(config, field, value)
+        if field not in operator_fields:
+            setattr(config, field, value)
 
-    active_entries = db.query(WaitlistEntry).filter(
-        WaitlistEntry.status.in_([WaitlistStatus.PENDING, WaitlistStatus.NOTIFIED]),
-    ).join(
-        PriorityConfig,
-        PriorityConfig.course_id == course_id,
-        isouter=True,
-    ).all()
+    db.flush()
+
+    refresh_result = waitlist_service.refresh_priority_for_course(
+        db=db,
+        course_id=course_id,
+        operator_id=config_in.operator_id,
+        operator_name=config_in.operator_name,
+        source=config_in.source,
+    )
 
     db.commit()
     db.refresh(config)
+
     return config
+
+
+@router.post("/priority-config/{course_id}/refresh", summary="手动刷新某课程的所有排队学员优先级")
+def refresh_priority(
+    course_id: int,
+    operator_id: Optional[str] = Query(None),
+    operator_name: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    try:
+        result = waitlist_service.refresh_priority_for_course(
+            db=db,
+            course_id=course_id,
+            operator_id=operator_id,
+            operator_name=operator_name,
+            source=source,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/funnel/daily", response_model=FunnelDailyResponse, summary="门店补位漏斗日报")
+def get_funnel_daily_report(
+    store_id: Optional[int] = Query(None),
+    course_id: Optional[int] = Query(None),
+    slot_id: Optional[int] = Query(None),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    db: Session = Depends(get_db),
+):
+    return waitlist_service.get_funnel_daily_report(
+        db=db,
+        store_id=store_id,
+        course_id=course_id,
+        slot_id=slot_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
+@router.get("/audit-logs", response_model=WaitlistAuditLogQueryResponse, summary="查询候补操作审计日志")
+def get_audit_logs(
+    slot_id: Optional[int] = Query(None),
+    student_id: Optional[int] = Query(None),
+    action: Optional[WaitlistAuditAction] = Query(None),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    total, logs = waitlist_service.get_audit_logs(
+        db=db,
+        slot_id=slot_id,
+        student_id=student_id,
+        action=action,
+        date_from=date_from,
+        date_to=date_to,
+        skip=skip,
+        limit=limit,
+    )
+
+    items = []
+    for log in logs:
+        item = {
+            "id": log.id,
+            "waitlist_entry_id": log.waitlist_entry_id,
+            "slot_id": log.slot_id,
+            "student_id": log.student_id,
+            "student_name": log.student.name if log.student else None,
+            "student_phone": log.student.phone if log.student else None,
+            "action": log.action.value if hasattr(log.action, "value") else str(log.action),
+            "previous_status": log.previous_status.value if log.previous_status and hasattr(log.previous_status, "value") else (str(log.previous_status) if log.previous_status else None),
+            "new_status": log.new_status.value if log.new_status and hasattr(log.new_status, "value") else (str(log.new_status) if log.new_status else None),
+            "previous_priority_score": log.previous_priority_score,
+            "new_priority_score": log.new_priority_score,
+            "operator_id": log.operator_id,
+            "operator_name": log.operator_name,
+            "source": log.source,
+            "details": log.details,
+            "created_at": log.created_at,
+        }
+        items.append(item)
+
+    return {"total": total, "items": items}

@@ -11,6 +11,7 @@ from app.models import (
     MemberLevel,
     AttendanceStatus,
     NotificationTimelineEvent,
+    WaitlistAuditAction,
 )
 
 
@@ -425,3 +426,68 @@ class PaginatedResponse(BaseModel):
     page: int
     page_size: int
     items: List
+
+
+class FunnelDailyEntry(BaseModel):
+    date: str
+    course_id: int
+    course_name: str
+    store_id: int
+    store_name: str
+    slot_id: int
+    slot_start_time: datetime
+    slot_end_time: datetime
+    total_waitlist: int
+    total_notified: int
+    total_delivered: int
+    total_read: int
+    total_confirmed: int
+    total_declined: int
+    total_timeout: int
+    total_attended: int
+    total_no_show: int
+    notification_rate: float
+    delivery_rate: float
+    read_rate: float
+    confirmation_rate: float
+    attendance_rate: float
+    conversion_rate: float
+
+
+class FunnelDailyResponse(BaseModel):
+    total_records: int
+    summary: Dict[str, Any]
+    data: List[FunnelDailyEntry]
+
+
+class PriorityConfigUpdateWithOperator(PriorityConfigUpdate):
+    operator_id: Optional[str] = None
+    operator_name: Optional[str] = None
+    source: Optional[str] = None
+
+
+class WaitlistAuditLogResponse(BaseModel):
+    id: int
+    waitlist_entry_id: int
+    slot_id: int
+    student_id: int
+    student_name: Optional[str] = None
+    student_phone: Optional[str] = None
+    action: str
+    previous_status: Optional[str] = None
+    new_status: Optional[str] = None
+    previous_priority_score: Optional[int] = None
+    new_priority_score: Optional[int] = None
+    operator_id: Optional[str] = None
+    operator_name: Optional[str] = None
+    source: Optional[str] = None
+    details: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class WaitlistAuditLogQueryResponse(BaseModel):
+    total: int
+    items: List[WaitlistAuditLogResponse]

@@ -258,3 +258,45 @@ class PriorityConfig(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     course = relationship("Course")
+
+
+class WaitlistAuditAction(str, enum.Enum):
+    CREATED = "created"
+    CANCELLED = "cancelled"
+    URGENT_UPDATED = "urgent_updated"
+    NOTIFIED = "notified"
+    CONFIRMED = "confirmed"
+    DECLINED = "declined"
+    TIMEOUT = "timeout"
+    ATTENDED = "attended"
+    NO_SHOW = "no_show"
+    PRIORITY_RECALCULATED = "priority_recalculated"
+    ROLLOVER = "rollover"
+
+
+class WaitlistAuditLog(Base):
+    __tablename__ = "waitlist_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    waitlist_entry_id = Column(Integer, ForeignKey("waitlist_entries.id"), nullable=False, index=True)
+    slot_id = Column(Integer, ForeignKey("course_slots.id"), nullable=False, index=True)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
+    action = Column(Enum(WaitlistAuditAction), nullable=False, index=True)
+    previous_status = Column(Enum(WaitlistStatus))
+    new_status = Column(Enum(WaitlistStatus))
+    previous_priority_score = Column(Integer)
+    new_priority_score = Column(Integer)
+    operator_id = Column(String(100))
+    operator_name = Column(String(100))
+    source = Column(String(50))
+    details = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    waitlist_entry = relationship("WaitlistEntry")
+    slot = relationship("CourseSlot")
+    student = relationship("Student")
+
+    __table_args__ = (
+        Index("idx_audit_slot_student", "slot_id", "student_id", "created_at"),
+        Index("idx_audit_action_time", "action", "created_at"),
+    )

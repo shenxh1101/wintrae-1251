@@ -33,12 +33,13 @@ def get_notification(
 
 @router.post("/{notification_id}/delivery-receipt", response_model=NotificationResponse, summary="上报通知送达回执")
 def report_delivery_receipt(
+    notification_id: int,
     receipt_in: NotificationDeliveryReceipt,
     db: Session = Depends(get_db),
 ):
     result = notification_service.process_delivery_receipt(
         db=db,
-        notification_id=receipt_in.notification_id,
+        notification_id=notification_id,
         channel=receipt_in.channel,
         delivered=receipt_in.delivered,
         error_message=receipt_in.error_message,
@@ -50,12 +51,13 @@ def report_delivery_receipt(
 
 @router.post("/{notification_id}/read-receipt", response_model=NotificationResponse, summary="上报通知已读回执")
 def report_read_receipt(
+    notification_id: int,
     receipt_in: NotificationReadReceipt,
     db: Session = Depends(get_db),
 ):
     result = notification_service.process_read_receipt(
         db=db,
-        notification_id=receipt_in.notification_id,
+        notification_id=notification_id,
         channel=receipt_in.channel,
     )
     if not result:

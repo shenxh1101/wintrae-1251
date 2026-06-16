@@ -417,6 +417,14 @@ class NotificationService:
 
         if not notification.delivered_at:
             notification.delivered_at = datetime.utcnow()
+            if notification.status in [NotificationStatus.SENT, NotificationStatus.FAILED]:
+                notification.status = NotificationStatus.DELIVERED
+            self.add_timeline_event(
+                db, notification.id, "delivered",
+                channel=channel,
+                message=f"{channel.value}送达成功(已读回执补录)",
+            )
+
         notification.read_at = datetime.utcnow()
         notification.status = NotificationStatus.READ
 
