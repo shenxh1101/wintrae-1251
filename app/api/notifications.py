@@ -4,21 +4,63 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import NotificationType, NotificationStatus, NotificationChannel
-from app.schemas import NotificationResponse
+from app.schemas import (
+    NotificationResponse,
+    NotificationDeliveryReceipt,
+    NotificationReadReceipt,
+)
 from app.services.notification_service import notification_service
 
 router = APIRouter(prefix="/notifications", tags=["通知查询"])
 
 
-@router.get("/{notification_id}", response_model=NotificationResponse, summary="获取通知详情")
+@router.get("/{notification_id}", response_model=NotificationResponse, summary="获取通知详情（含完整时间线）")
 def get_notification(
     notification_id: int,
     db: Session = Depends(get_db),
 ):
-    notification = notification_service.get_notification(db=db, notification_id=notification_id)
-    if not notification:
+    full_notification = notification_service.get_notification_with_timeline(
+        db=db, notification_id=notification_id
+    )
+    if not full_notification:
         raise HTTPException(status_code=404, detail="Notification not found")
-    return notification
+
+    result = full_notification["notification"]
+    result.attempts = full_notification["attempts"]
+    result.timeline = full_notification["timeline"]
+    return result
+
+
+@router.post("/{notification_id}/delivery-receipt", response_model=NotificationResponse, summary="上报通知送达回执")
+def report_delivery_receipt(
+    receipt_in: NotificationDeliveryReceipt,
+    db: Session = Depends(get_db),
+):
+    result = notification_service.process_delivery_receipt(
+        db=db,
+        notification_id=receipt_in.notification_id,
+        channel=receipt_in.channel,
+        delivered=receipt_in.delivered,
+        error_message=receipt_in.error_message,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return result
+
+
+@router.post("/{notification_id}/read-receipt", response_model=NotificationResponse, summary="上报通知已读回执")
+def report_read_receipt(
+    receipt_in: NotificationReadReceipt,
+    db: Session = Depends(get_db),
+):
+    result = notification_service.process_read_receipt(
+        db=db,
+        notification_id=receipt_in.notification_id,
+        channel=receipt_in.channel,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return result
 
 
 @router.get("/waitlist/{waitlist_entry_id}", response_model=List[NotificationResponse], summary="查询候补记录的通知历史")
@@ -28,12 +70,20 @@ def get_notifications_by_waitlist(
     status: Optional[NotificationStatus] = Query(None, description="通知状态过滤"),
     db: Session = Depends(get_db),
 ):
-    return notification_service.get_notifications_by_waitlist(
+    notifications = notification_service.get_notifications_by_waitlist(
         db=db,
         waitlist_entry_id=waitlist_entry_id,
         notification_type=notification_type,
         status=status,
     )
+    results = []
+    for n in notifications:
+        full = notification_service.get_notification_with_timeline(db, n.id)
+        if full:
+            n.attempts = full["attempts"]
+            n.timeline = full["timeline"]
+        results.append(n)
+    return results
 
 
 @router.get("/student/{student_id}", response_model=List[NotificationResponse], summary="查询学员的通知记录")
@@ -84,7 +134,7 @@ def update_notification_status(
     return notification
 
 
-@router.get("/pending", summary="获取待处理的通知（用于重试发送）")
+@router.get("/pending/retry", summary="获取待重试的失败通知列表")
 def get_pending_notifications(
     channel: Optional[NotificationChannel] = Query(None, description="通知渠道过滤"),
     limit: int = Query(100, ge=1, le=500),
@@ -93,9 +143,22 @@ def get_pending_notifications(
     notifications = notification_service.get_pending_notifications(
         db=db, channel=channel, limit=limit
     )
+    results = []
+    for n in notifications:
+        results.append({
+            "id": n.id,
+            "waitlist_entry_id": n.waitlist_entry_id,
+            "type": n.type.value if hasattr(n.type, 'value') else str(n.type),
+            "channel": n.channel.value if hasattr(n.channel, 'value') else str(n.channel),
+            "status": n.status.value if hasattr(n.status, 'value') else str(n.status),
+            "attempt_count": n.attempt_count,
+            "next_retry_at": n.next_retry_at.isoformat() if n.next_retry_at else None,
+            "error_message": n.error_message,
+            "sent_at": n.sent_at.isoformat() if n.sent_at else None,
+        })
     return {
-        "count": len(notifications),
-        "notifications": notifications,
+        "count": len(results),
+        "notifications": results,
     }
 
 

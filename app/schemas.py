@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -10,6 +10,7 @@ from app.models import (
     NotificationStatus,
     MemberLevel,
     AttendanceStatus,
+    NotificationTimelineEvent,
 )
 
 
@@ -165,6 +166,12 @@ class AttendanceMarkRequest(BaseModel):
     attendance_status: AttendanceStatus
 
 
+class BatchAttendanceRequest(BaseModel):
+    slot_id: int
+    attended_ids: Optional[List[int]] = Field(default_factory=list, description="标记为已到课的候补记录ID列表")
+    no_show_ids: Optional[List[int]] = Field(default_factory=list, description="标记为未到课的候补记录ID列表")
+
+
 class WaitlistPositionResponse(BaseModel):
     entry_id: int
     slot_id: int
@@ -180,6 +187,19 @@ class WaitlistPositionResponse(BaseModel):
     priority_score: int
     is_urgent: bool
     priority_reasons: List[str] = []
+
+
+class WaitlistPreviewResponse(BaseModel):
+    slot_id: int
+    course_name: str
+    slot_start_time: datetime
+    predicted_position: int
+    total_after_submit: int
+    priority_score: int
+    is_urgent: bool
+    priority_reasons: List[str]
+    member_level: str
+    is_returning_student: bool
 
 
 class WaitlistEntryResponse(BaseModel):
@@ -220,6 +240,14 @@ class NotificationAttemptResponse(BaseModel):
         from_attributes = True
 
 
+class NotificationTimelineResponse(BaseModel):
+    id: int
+    event: NotificationTimelineEvent
+    channel: Optional[NotificationChannel]
+    message: Optional[str]
+    created_at: datetime
+
+
 class NotificationResponse(BaseModel):
     id: int
     waitlist_entry_id: int
@@ -236,6 +264,53 @@ class NotificationResponse(BaseModel):
     channel_attempt_order: Optional[str]
     created_at: datetime
     attempts: List[NotificationAttemptResponse] = []
+    timeline: List[NotificationTimelineResponse] = []
+
+    class Config:
+        from_attributes = True
+
+
+class NotificationDeliveryReceipt(BaseModel):
+    notification_id: int
+    channel: NotificationChannel
+    delivered: bool
+    error_message: Optional[str] = Field(None, max_length=255)
+
+
+class NotificationReadReceipt(BaseModel):
+    notification_id: int
+    channel: NotificationChannel
+
+
+class PriorityConfigBase(BaseModel):
+    course_id: int
+    member_level_score_normal: int = Field(0, ge=0, description="普通会员优先级分数")
+    member_level_score_silver: int = Field(10, ge=0, description="银牌会员优先级分数")
+    member_level_score_gold: int = Field(20, ge=0, description="金牌会员优先级分数")
+    member_level_score_platinum: int = Field(30, ge=0, description="铂金会员优先级分数")
+    returning_student_bonus: int = Field(15, ge=0, description="老学员加成")
+    urgent_bonus: int = Field(50, ge=0, description="手动加急加成")
+
+
+class PriorityConfigCreate(PriorityConfigBase):
+    pass
+
+
+class PriorityConfigUpdate(BaseModel):
+    member_level_score_normal: Optional[int] = None
+    member_level_score_silver: Optional[int] = None
+    member_level_score_gold: Optional[int] = None
+    member_level_score_platinum: Optional[int] = None
+    returning_student_bonus: Optional[int] = None
+    urgent_bonus: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class PriorityConfigResponse(PriorityConfigBase):
+    id: int
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
@@ -296,6 +371,53 @@ class SlotWaitlistDashboardResponse(BaseModel):
     no_show_count: int
     available_release_slots: int
     total_waitlist_count: int
+    attendance_rate: float = 0.0
+    conversion_rate: float = 0.0
+
+
+class AttendanceRosterEntry(BaseModel):
+    entry_id: int
+    student_id: int
+    student_name: str
+    student_phone: str
+    member_level: Optional[str]
+    is_returning_student: bool
+    status: str
+    attendance_status: Optional[str]
+    confirmed_at: Optional[datetime]
+    attended_at: Optional[datetime]
+    no_show_at: Optional[datetime]
+    queue_position: int
+    priority_score: int
+
+
+class AttendanceRosterSlot(BaseModel):
+    slot_id: int
+    course_id: int
+    store_id: int
+    course_name: str
+    store_name: str
+    start_time: datetime
+    end_time: datetime
+    capacity: int
+    enrolled_count: int
+    teacher: Optional[str]
+    location: Optional[str]
+    total_entries: int
+    total_confirmed_pending_mark: int
+    total_attended: int
+    total_no_show: int
+    attendance_rate: float
+    pending_mark_rate: float
+    entries: List[AttendanceRosterEntry]
+
+
+class AttendanceRosterResponse(BaseModel):
+    total_slots: int
+    total_entries: int
+    total_attended: int
+    total_no_show: int
+    slots: List[AttendanceRosterSlot]
 
 
 class PaginatedResponse(BaseModel):

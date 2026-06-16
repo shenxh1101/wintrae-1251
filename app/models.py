@@ -165,7 +165,7 @@ class WaitlistEntry(Base):
     notifications = relationship("Notification", back_populates="waitlist_entry")
 
     __table_args__ = (
-        UniqueConstraint("slot_id", "student_id", name="uix_slot_student"),
+        Index("idx_slot_student_status", "slot_id", "student_id", "status"),
         Index("idx_slot_status_created", "slot_id", "status", "created_at"),
         Index("idx_slot_priority_created", "slot_id", "priority_score", "created_at"),
     )
@@ -210,3 +210,51 @@ class NotificationAttempt(Base):
     __table_args__ = (
         Index("idx_notification_attempt", "notification_id", "attempt_number"),
     )
+
+
+class NotificationTimelineEvent(str, enum.Enum):
+    CREATED = "created"
+    SEND_ATTEMPT = "send_attempt"
+    SEND_SUCCESS = "send_success"
+    SEND_FAIL = "send_fail"
+    RETRY_SCHEDULED = "retry_scheduled"
+    DELIVERED = "delivered"
+    READ = "read"
+    CONFIRMED = "confirmed"
+    DECLINED = "declined"
+    TIMEOUT = "timeout"
+
+
+class NotificationTimeline(Base):
+    __tablename__ = "notification_timelines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    notification_id = Column(Integer, ForeignKey("notifications.id"), nullable=False, index=True)
+    event = Column(Enum(NotificationTimelineEvent), nullable=False)
+    channel = Column(Enum(NotificationChannel))
+    message = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    notification = relationship("Notification")
+
+    __table_args__ = (
+        Index("idx_notification_timeline", "notification_id", "created_at"),
+    )
+
+
+class PriorityConfig(Base):
+    __tablename__ = "priority_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    course_id = Column(Integer, ForeignKey("courses.id"), nullable=False, unique=True, index=True)
+    member_level_score_normal = Column(Integer, default=0)
+    member_level_score_silver = Column(Integer, default=10)
+    member_level_score_gold = Column(Integer, default=20)
+    member_level_score_platinum = Column(Integer, default=30)
+    returning_student_bonus = Column(Integer, default=15)
+    urgent_bonus = Column(Integer, default=50)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    course = relationship("Course")

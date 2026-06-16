@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 from app.models import (
     Notification,
     NotificationAttempt,
+    NotificationTimeline,
+    NotificationTimelineEvent,
     NotificationType,
     NotificationChannel,
     NotificationStatus,
@@ -46,6 +48,30 @@ class NotificationService:
             return False, f"{channel.value} service temporarily unavailable"
         return True, None
 
+    def add_timeline_event(
+        self,
+        db: Session,
+        notification_id: int,
+        event: str,
+        channel: Optional[NotificationChannel] = None,
+        message: Optional[str] = None,
+    ) -> NotificationTimeline:
+        try:
+            event_enum = NotificationTimelineEvent(event)
+        except ValueError:
+            valid_values = [e.value for e in NotificationTimelineEvent]
+            raise ValueError(f"Invalid timeline event '{event}'. Valid values: {valid_values}")
+
+        timeline = NotificationTimeline(
+            notification_id=notification_id,
+            event=event_enum,
+            channel=channel,
+            message=message,
+            created_at=datetime.utcnow(),
+        )
+        db.add(timeline)
+        return timeline
+
     def create_notification(
         self,
         db: Session,
@@ -76,10 +102,20 @@ class NotificationService:
         db.add(notification)
         db.flush()
 
+        self.add_timeline_event(
+            db, notification.id, "created",
+            message=f"通知创建完成, 渠道顺序: {channel_order_str}",
+        )
+
         success = False
         error_msg = None
         for idx, channel in enumerate(channels):
             attempt_num = idx + 1
+            self.add_timeline_event(
+                db, notification.id, "send_attempt",
+                channel=channel,
+                message=f"第{attempt_num}次尝试通过{channel.value}发送",
+            )
             ok, err = self._simulate_channel_send(channel, student)
             attempt = NotificationAttempt(
                 notification_id=notification.id,
@@ -97,14 +133,29 @@ class NotificationService:
                 notification.status = NotificationStatus.SENT
                 notification.error_message = None
                 success = True
+                self.add_timeline_event(
+                    db, notification.id, "send_success",
+                    channel=channel,
+                    message=f"通过{channel.value}发送成功",
+                )
                 break
             else:
                 error_msg = f"{channel.value}: {err}"
                 notification.error_message = error_msg
                 notification.status = NotificationStatus.FAILED
+                self.add_timeline_event(
+                    db, notification.id, "send_fail",
+                    channel=channel,
+                    message=f"通过{channel.value}发送失败: {err}",
+                )
 
         if not success and notification.attempt_count < settings.MAX_NOTIFICATION_RETRIES:
-            notification.next_retry_at = datetime.utcnow() + timedelta(minutes=settings.NOTIFICATION_RETRY_INTERVAL_MINUTES)
+            next_retry = datetime.utcnow() + timedelta(minutes=settings.NOTIFICATION_RETRY_INTERVAL_MINUTES)
+            notification.next_retry_at = next_retry
+            self.add_timeline_event(
+                db, notification.id, "retry_scheduled",
+                message=f"已安排重试, 下次重试时间: {next_retry.isoformat()}",
+            )
 
         db.commit()
         db.refresh(notification)
@@ -135,6 +186,13 @@ class NotificationService:
 
         channel = channels[next_channel_idx]
         attempt_num = current_attempt + 1
+
+        self.add_timeline_event(
+            db, notification.id, "send_attempt",
+            channel=channel,
+            message=f"第{attempt_num}次重试(补发)通过{channel.value}发送",
+        )
+
         ok, err = self._simulate_channel_send(channel, student)
 
         attempt = NotificationAttempt(
@@ -153,13 +211,32 @@ class NotificationService:
             notification.status = NotificationStatus.SENT
             notification.error_message = None
             notification.next_retry_at = None
+            self.add_timeline_event(
+                db, notification.id, "send_success",
+                channel=channel,
+                message=f"重试通过{channel.value}发送成功",
+            )
         else:
             notification.error_message = f"{channel.value}: {err}"
             notification.status = NotificationStatus.FAILED
+            self.add_timeline_event(
+                db, notification.id, "send_fail",
+                channel=channel,
+                message=f"重试通过{channel.value}发送失败: {err}",
+            )
             if attempt_num < settings.MAX_NOTIFICATION_RETRIES:
-                notification.next_retry_at = datetime.utcnow() + timedelta(minutes=settings.NOTIFICATION_RETRY_INTERVAL_MINUTES)
+                next_retry = datetime.utcnow() + timedelta(minutes=settings.NOTIFICATION_RETRY_INTERVAL_MINUTES)
+                notification.next_retry_at = next_retry
+                self.add_timeline_event(
+                    db, notification.id, "retry_scheduled",
+                    message=f"已安排下次重试, 时间: {next_retry.isoformat()}",
+                )
             else:
                 notification.next_retry_at = None
+                self.add_timeline_event(
+                    db, notification.id, "send_fail",
+                    message=f"已达到最大重试次数({settings.MAX_NOTIFICATION_RETRIES}), 停止重试",
+                )
 
         db.commit()
         db.refresh(notification)
@@ -193,6 +270,38 @@ class NotificationService:
         notification_id: int,
     ) -> Optional[Notification]:
         return db.query(Notification).filter(Notification.id == notification_id).first()
+
+    def get_notification_with_timeline(
+        self,
+        db: Session,
+        notification_id: int,
+    ) -> Optional[dict]:
+        notification = self.get_notification(db, notification_id)
+        if not notification:
+            return None
+
+        attempts = db.query(NotificationAttempt).filter(
+            NotificationAttempt.notification_id == notification_id
+        ).order_by(NotificationAttempt.attempt_number.asc()).all()
+
+        timeline = db.query(NotificationTimeline).filter(
+            NotificationTimeline.notification_id == notification_id
+        ).order_by(NotificationTimeline.created_at.asc()).all()
+
+        return {
+            "notification": notification,
+            "attempts": attempts,
+            "timeline": [
+                {
+                    "id": t.id,
+                    "event": t.event.value,
+                    "channel": t.channel.value if t.channel else None,
+                    "message": t.message,
+                    "created_at": t.created_at,
+                }
+                for t in timeline
+            ],
+        }
 
     def get_notifications_by_waitlist(
         self,
@@ -241,10 +350,81 @@ class NotificationService:
         notification.status = status
         if status == NotificationStatus.DELIVERED and not notification.delivered_at:
             notification.delivered_at = datetime.utcnow()
+            self.add_timeline_event(
+                db, notification.id, "delivered",
+                channel=notification.channel,
+                message=f"{notification.channel.value}送达回执确认",
+            )
         if status == NotificationStatus.READ and not notification.read_at:
             notification.read_at = datetime.utcnow()
+            self.add_timeline_event(
+                db, notification.id, "read",
+                channel=notification.channel,
+                message=f"{notification.channel.value}已读回执确认",
+            )
+            if not notification.delivered_at:
+                notification.delivered_at = datetime.utcnow()
         if error_message:
             notification.error_message = error_message
+
+        db.commit()
+        db.refresh(notification)
+        return notification
+
+    def process_delivery_receipt(
+        self,
+        db: Session,
+        notification_id: int,
+        channel: NotificationChannel,
+        delivered: bool,
+        error_message: Optional[str] = None,
+    ) -> Optional[Notification]:
+        notification = self.get_notification(db, notification_id)
+        if not notification:
+            return None
+
+        if delivered:
+            notification.delivered_at = datetime.utcnow()
+            if notification.status in [NotificationStatus.SENT, NotificationStatus.FAILED]:
+                notification.status = NotificationStatus.DELIVERED
+            self.add_timeline_event(
+                db, notification.id, "delivered",
+                channel=channel,
+                message=f"{channel.value}送达成功",
+            )
+        else:
+            self.add_timeline_event(
+                db, notification.id, "send_fail",
+                channel=channel,
+                message=f"{channel.value}送达失败: {error_message or '未知原因'}",
+            )
+            if error_message:
+                notification.error_message = f"{channel.value} delivery failed: {error_message}"
+
+        db.commit()
+        db.refresh(notification)
+        return notification
+
+    def process_read_receipt(
+        self,
+        db: Session,
+        notification_id: int,
+        channel: NotificationChannel,
+    ) -> Optional[Notification]:
+        notification = self.get_notification(db, notification_id)
+        if not notification:
+            return None
+
+        if not notification.delivered_at:
+            notification.delivered_at = datetime.utcnow()
+        notification.read_at = datetime.utcnow()
+        notification.status = NotificationStatus.READ
+
+        self.add_timeline_event(
+            db, notification.id, "read",
+            channel=channel,
+            message=f"{channel.value}已读确认",
+        )
 
         db.commit()
         db.refresh(notification)
@@ -256,15 +436,17 @@ class NotificationService:
         channel: Optional[NotificationChannel] = None,
         limit: int = 100,
     ) -> List[Notification]:
+        now = datetime.utcnow()
         query = db.query(Notification).filter(
-            Notification.status.in_([
-                NotificationStatus.SENT,
-                NotificationStatus.FAILED,
-            ])
+            and_(
+                Notification.status == NotificationStatus.FAILED,
+                Notification.next_retry_at.isnot(None),
+                Notification.attempt_count < settings.MAX_NOTIFICATION_RETRIES,
+            )
         )
         if channel:
             query = query.filter(Notification.channel == channel)
-        return query.order_by(Notification.sent_at.asc()).limit(limit).all()
+        return query.order_by(Notification.next_retry_at.asc()).limit(limit).all()
 
     def mark_notification_read(
         self,
@@ -294,9 +476,19 @@ class NotificationService:
         delivered = query.filter(Notification.status == NotificationStatus.DELIVERED).count()
         read = query.filter(Notification.status == NotificationStatus.READ).count()
         failed = query.filter(Notification.status == NotificationStatus.FAILED).count()
+        pending_retry = query.filter(
+            and_(
+                Notification.status == NotificationStatus.FAILED,
+                Notification.next_retry_at.isnot(None),
+            )
+        ).count()
 
         total_attempts = db.query(NotificationAttempt).count()
         avg_attempts = total_attempts / total if total > 0 else 0
+
+        total_delivered = delivered + read
+        delivery_rate = total_delivered / total if total > 0 else 0
+        read_rate = read / total_delivered if total_delivered > 0 else 0
 
         return {
             "total": total,
@@ -304,10 +496,11 @@ class NotificationService:
             "delivered": delivered,
             "read": read,
             "failed": failed,
+            "pending_retry": pending_retry,
             "total_attempts": total_attempts,
             "avg_attempts_per_notification": round(avg_attempts, 2),
-            "delivery_rate": delivered / total if total > 0 else 0,
-            "read_rate": read / delivered if delivered > 0 else 0,
+            "delivery_rate": round(delivery_rate, 4),
+            "read_rate": round(read_rate, 4),
         }
 
 
